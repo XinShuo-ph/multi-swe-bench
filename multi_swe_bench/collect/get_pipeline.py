@@ -57,6 +57,12 @@ def get_parser() -> argparse.ArgumentParser:
         default=False,
         help="Skip commit message.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of workers for parallel processing in step 2 (filter_prs).",
+    )
 
     return parser
 
@@ -69,6 +75,7 @@ def run_pipeline(
     delay_on_error: int = 300,
     retry_attempts: int = 3,
     skip_commit_message: bool = False,
+    workers: int = 1,
 ) -> None:
     # step 1: get all pull requests
     get_all_prs(tokens, out_dir, org, repo)
@@ -77,7 +84,7 @@ def run_pipeline(
     # - closed
     # - resolve some issues
     pull_file = out_dir / f"{org}__{repo}_prs.jsonl"
-    filter_prs(tokens, out_dir, pull_file, skip_commit_message)
+    filter_prs(tokens, out_dir, pull_file, skip_commit_message, workers)
 
     # step 3: get related issues
     pull_file = out_dir / f"{org}__{repo}_filtered_prs.jsonl"
@@ -106,4 +113,5 @@ if __name__ == "__main__":
         delay_on_error=args.delay_on_error,
         retry_attempts=args.retry_attempts,
         skip_commit_message=args.skip_commit_message,
+        workers=args.workers,
     )
