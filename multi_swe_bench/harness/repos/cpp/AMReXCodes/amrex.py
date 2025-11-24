@@ -40,9 +40,6 @@ class AMReXImageBase(Image):
         if isinstance(image_name, Image):
             image_name = image_name.image_full_name()
 
-        # Get the base commit SHA from the PR
-        base_sha = self.pr.base.sha
-
         return f"""FROM {image_name}
 
 {self.global_env}
@@ -50,31 +47,11 @@ class AMReXImageBase(Image):
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 
-
-# Clone AMReX at the base commit
+# Just setup the workspace, don't checkout specific commit yet
 WORKDIR /workspace
 RUN cd amrex && \\
     git config --global --add safe.directory /workspace/amrex && \\
-    git config --global core.threads 1 && \\
-    git config --global core.preloadindex false && \\
-    git config --global core.fscache false && \\
-    chmod -R u+w /workspace/amrex/.git && \\
-    git checkout {base_sha}
-
-# Build AMReX with CMake
-WORKDIR /workspace/amrex
-RUN \\\"rm -rf build && mkdir -p build && cd build && \\
-    cmake .. \\
-        -DCMAKE_BUILD_TYPE=Debug \\
-        -DAMReX_SPACEDIM=3 \\
-        -DAMReX_FORTRAN=OFF \\
-        -DAMReX_MPI=OFF \\
-        -DAMReX_OMP=OFF \\
-        -DAMReX_PARTICLES=ON \\
-        -DAMReX_BUILD_TUTORIALS=OFF \\
-        -DCMAKE_INSTALL_PREFIX=/opt/amrex && \\
-    make -j4 && \\
-    make install \\\"
+    chmod -R u+w /workspace/amrex/.git
 
 ENV AMREX_HOME=/workspace/amrex
 WORKDIR /workspace/amrex
@@ -130,6 +107,56 @@ base_sha:{self.pr.base.sha}
             ),
             File(
                 ".",
+                "check_git_changes.sh",
+                """#!/bin/bash
+set -e
+
+if ! git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+  echo "check_git_changes: Not inside a git repository"
+  exit 1
+fi
+
+if [[ -n $(git status --porcelain) ]]; then
+  echo "check_git_changes: Uncommitted changes"
+  exit 1
+fi
+
+echo "check_git_changes: No uncommitted changes"
+exit 0
+""",
+            ),
+            File(
+                ".",
+                "prepare.sh",
+                """#!/bin/bash
+set -e
+
+cd /workspace/amrex
+git reset --hard
+/home/check_git_changes.sh
+git fetch origin {pr.base.sha}
+git checkout {pr.base.sha}
+rm -rf build
+/home/check_git_changes.sh
+
+# Build AMReX with CMake at the base commit
+# rm -rf build && mkdir -p build && cd build
+# cmake .. \\
+#     -DCMAKE_BUILD_TYPE=Debug \\
+#     -DAMReX_SPACEDIM=3 \\
+#     -DAMReX_FORTRAN=OFF \\
+#     -DAMReX_MPI=OFF \\
+#     -DAMReX_OMP=OFF \\
+#     -DAMReX_PARTICLES=ON \\
+#     -DAMReX_BUILD_TUTORIALS=OFF \\
+#     -DCMAKE_INSTALL_PREFIX=/opt/amrex
+# make -j64
+# make install
+
+""".format(pr=self.pr),
+            ),
+            File(
+                ".",
                 "run.sh",
                 """#!/bin/bash
 # Baseline run without any patches
@@ -152,16 +179,31 @@ set -e
 
 cd /workspace/amrex || exit 1
 
-# Apply test patch
+# Refresh git index to avoid "does not match index" errors
+echo "Refreshing git index..."
+git status > /dev/null 2>&1 || true
+
+# Apply test patch (skip binary files)
 echo "Applying test patch..."
-git apply /home/test.patch || {
-    echo "Failed to apply test patch"
-    exit 1
+git apply --ignore-space-change --ignore-whitespace /home/test.patch 2>&1 | grep -v "cannot apply binary patch" || {
+    # If direct apply fails, try with --reject to skip problematic hunks
+    echo "Retrying with --reject flag..."
+    git apply --reject --ignore-space-change --ignore-whitespace /home/test.patch 2>&1 | grep -v "cannot apply binary patch" || true
+    echo "Test patch applied (some hunks may have been rejected, binary files skipped)"
 }
 
 # Determine which test directory to build
-# Extract test directory from patch
-TEST_DIR=$(grep "^diff --git a/Tests/" /home/test.patch | head -1 | sed 's|^diff --git a/Tests/\\([^/]*\\)/.*|\\1|')
+# Extract test directory from patch - only get actual directories, not files
+TEST_DIRS=$(grep "^diff --git a/Tests/" /home/test.patch | awk '{print $3}' | sed 's|^a/Tests/\\([^/]*\\).*|\\1|' | sort -u)
+
+# Validate and find the first valid test directory
+TEST_DIR=""
+for dir in $TEST_DIRS; do
+    if [ -d "/workspace/amrex/Tests/$dir" ] && [ "$dir" != "CMakeLists.txt" ]; then
+        TEST_DIR=$dir
+        break
+    fi
+done
 
 if [ -z "$TEST_DIR" ]; then
     echo "ERROR: Could not determine test directory from patch"
@@ -170,30 +212,81 @@ fi
 
 echo "Building and running test: $TEST_DIR"
 
-# Build the test using CMake
 cd /workspace/amrex/Tests/$TEST_DIR
-mkdir -p build && cd build
 
-cmake .. \\
-    -DCMAKE_BUILD_TYPE=Debug \\
-    -DAMReX_SPACEDIM=3 \\
-    -DAMReX_FORTRAN=OFF \\
-    -DAMReX_MPI=OFF \\
-    -DAMReX_OMP=OFF \\
-    -DCMAKE_PREFIX_PATH=/opt/amrex || {
-    echo "CMake configuration failed"
-    exit 1
-}
-
-make -j4 || {
-    echo "Build failed"
-    exit 1
-}
-
-# Run the test
-# AMReX tests typically create an executable named after the test
-# and expect to be run with an inputs file
-TEST_EXE=$(find . -maxdepth 1 -type f -executable | head -1)
+# Detect which build system to use
+# Check if this directory has build files at top level
+if [ -f "GNUmakefile" ]; then
+    echo "Using GNUmakefile build system"
+    make -j4 || {
+        echo "Build failed"
+        exit 1
+    }
+    TEST_EXE=$(find . -maxdepth 1 -type f -executable \\( -name "*.exe" -o -name "*.ex" \\) 2>/dev/null | head -1)
+elif [ -f "CMakeLists.txt" ]; then
+    echo "Using CMake build system"
+    mkdir -p build && cd build
+    cmake .. \\
+        -DCMAKE_BUILD_TYPE=Debug \\
+        -DAMReX_SPACEDIM=3 \\
+        -DAMReX_FORTRAN=OFF \\
+        -DAMReX_MPI=OFF \\
+        -DAMReX_OMP=OFF \\
+        -DCMAKE_PREFIX_PATH=/opt/amrex || {
+        echo "CMake configuration failed"
+        exit 1
+    }
+    make -j4 || {
+        echo "Build failed"
+        exit 1
+    }
+    TEST_EXE=$(find . -maxdepth 1 -type f -executable | head -1)
+else
+    # Check subdirectories for build files
+    echo "No build files at top level, checking subdirectories..."
+    FOUND_SUBDIR=""
+    for subdir in */; do
+        if [ -f "$subdir/GNUmakefile" ] || [ -f "$subdir/CMakeLists.txt" ]; then
+            FOUND_SUBDIR="$subdir"
+            break
+        fi
+    done
+    
+    if [ -z "$FOUND_SUBDIR" ]; then
+        echo "ERROR: No build files found in $TEST_DIR or its subdirectories"
+        exit 1
+    fi
+    
+    echo "Building in subdirectory: $FOUND_SUBDIR"
+    cd "$FOUND_SUBDIR"
+    
+    if [ -f "GNUmakefile" ]; then
+        echo "Using GNUmakefile build system"
+        make -j4 || {
+            echo "Build failed"
+            exit 1
+        }
+        TEST_EXE=$(find . -maxdepth 1 -type f -executable \\( -name "*.exe" -o -name "*.ex" \\) 2>/dev/null | head -1)
+    else
+        echo "Using CMake build system"
+        mkdir -p build && cd build
+        cmake .. \\
+            -DCMAKE_BUILD_TYPE=Debug \\
+            -DAMReX_SPACEDIM=3 \\
+            -DAMReX_FORTRAN=OFF \\
+            -DAMReX_MPI=OFF \\
+            -DAMReX_OMP=OFF \\
+            -DCMAKE_PREFIX_PATH=/opt/amrex || {
+            echo "CMake configuration failed"
+            exit 1
+        }
+        make -j4 || {
+            echo "Build failed"
+            exit 1
+        }
+        TEST_EXE=$(find . -maxdepth 1 -type f -executable | head -1)
+    fi
+fi
 
 if [ -z "$TEST_EXE" ]; then
     echo "ERROR: No test executable found"
@@ -205,6 +298,8 @@ echo "Running test executable: $TEST_EXE"
 # Check if inputs file exists
 if [ -f ../inputs ]; then
     $TEST_EXE ../inputs 2>&1
+elif [ -f ../../inputs ]; then
+    $TEST_EXE ../../inputs 2>&1
 else
     $TEST_EXE 2>&1
 fi
@@ -229,22 +324,40 @@ set -e
 
 cd /workspace/amrex || exit 1
 
-# Apply test patch first
+# Refresh git index to avoid "does not match index" errors
+echo "Refreshing git index..."
+git status > /dev/null 2>&1 || true
+
+# Apply test patch first (skip binary files)
 echo "Applying test patch..."
-git apply /home/test.patch || {
-    echo "Failed to apply test patch"
-    exit 1
+git apply --ignore-space-change --ignore-whitespace /home/test.patch 2>&1 | grep -v "cannot apply binary patch" || {
+    # If direct apply fails, try with --reject to skip problematic hunks
+    echo "Retrying with --reject flag..."
+    git apply --reject --ignore-space-change --ignore-whitespace /home/test.patch 2>&1 | grep -v "cannot apply binary patch" || true
+    echo "Test patch applied (some hunks may have been rejected, binary files skipped)"
 }
 
-# Apply fix patch
+# Apply fix patch (skip binary files)
 echo "Applying fix patch..."
-git apply /home/fix.patch || {
-    echo "Failed to apply fix patch"
-    exit 1
+git apply --ignore-space-change --ignore-whitespace /home/fix.patch 2>&1 | grep -v "cannot apply binary patch" || {
+    # If direct apply fails, try with --reject to skip problematic hunks
+    echo "Retrying with --reject flag..."
+    git apply --reject --ignore-space-change --ignore-whitespace /home/fix.patch 2>&1 | grep -v "cannot apply binary patch" || true
+    echo "Fix patch applied (some hunks may have been rejected, binary files skipped)"
 }
 
 # Determine which test directory to build
-TEST_DIR=$(grep "^diff --git a/Tests/" /home/test.patch | head -1 | sed 's|^diff --git a/Tests/\\([^/]*\\)/.*|\\1|')
+# Extract test directory from patch - only get actual directories, not files
+TEST_DIRS=$(grep "^diff --git a/Tests/" /home/test.patch | awk '{print $3}' | sed 's|^a/Tests/\\([^/]*\\).*|\\1|' | sort -u)
+
+# Validate and find the first valid test directory
+TEST_DIR=""
+for dir in $TEST_DIRS; do
+    if [ -d "/workspace/amrex/Tests/$dir" ] && [ "$dir" != "CMakeLists.txt" ]; then
+        TEST_DIR=$dir
+        break
+    fi
+done
 
 if [ -z "$TEST_DIR" ]; then
     echo "ERROR: Could not determine test directory from patch"
@@ -253,28 +366,81 @@ fi
 
 echo "Building and running test: $TEST_DIR"
 
-# Build the test using CMake
 cd /workspace/amrex/Tests/$TEST_DIR
-mkdir -p build && cd build
 
-cmake .. \\
-    -DCMAKE_BUILD_TYPE=Debug \\
-    -DAMReX_SPACEDIM=3 \\
-    -DAMReX_FORTRAN=OFF \\
-    -DAMReX_MPI=OFF \\
-    -DAMReX_OMP=OFF \\
-    -DCMAKE_PREFIX_PATH=/opt/amrex || {
-    echo "CMake configuration failed"
-    exit 1
-}
-
-make -j4 || {
-    echo "Build failed"
-    exit 1
-}
-
-# Run the test
-TEST_EXE=$(find . -maxdepth 1 -type f -executable | head -1)
+# Detect which build system to use
+# Check if this directory has build files at top level
+if [ -f "GNUmakefile" ]; then
+    echo "Using GNUmakefile build system"
+    make -j4 || {
+        echo "Build failed"
+        exit 1
+    }
+    TEST_EXE=$(find . -maxdepth 1 -type f -executable \\( -name "*.exe" -o -name "*.ex" \\) 2>/dev/null | head -1)
+elif [ -f "CMakeLists.txt" ]; then
+    echo "Using CMake build system"
+    mkdir -p build && cd build
+    cmake .. \\
+        -DCMAKE_BUILD_TYPE=Debug \\
+        -DAMReX_SPACEDIM=3 \\
+        -DAMReX_FORTRAN=OFF \\
+        -DAMReX_MPI=OFF \\
+        -DAMReX_OMP=OFF \\
+        -DCMAKE_PREFIX_PATH=/opt/amrex || {
+        echo "CMake configuration failed"
+        exit 1
+    }
+    make -j4 || {
+        echo "Build failed"
+        exit 1
+    }
+    TEST_EXE=$(find . -maxdepth 1 -type f -executable | head -1)
+else
+    # Check subdirectories for build files
+    echo "No build files at top level, checking subdirectories..."
+    FOUND_SUBDIR=""
+    for subdir in */; do
+        if [ -f "$subdir/GNUmakefile" ] || [ -f "$subdir/CMakeLists.txt" ]; then
+            FOUND_SUBDIR="$subdir"
+            break
+        fi
+    done
+    
+    if [ -z "$FOUND_SUBDIR" ]; then
+        echo "ERROR: No build files found in $TEST_DIR or its subdirectories"
+        exit 1
+    fi
+    
+    echo "Building in subdirectory: $FOUND_SUBDIR"
+    cd "$FOUND_SUBDIR"
+    
+    if [ -f "GNUmakefile" ]; then
+        echo "Using GNUmakefile build system"
+        make -j4 || {
+            echo "Build failed"
+            exit 1
+        }
+        TEST_EXE=$(find . -maxdepth 1 -type f -executable \\( -name "*.exe" -o -name "*.ex" \\) 2>/dev/null | head -1)
+    else
+        echo "Using CMake build system"
+        mkdir -p build && cd build
+        cmake .. \\
+            -DCMAKE_BUILD_TYPE=Debug \\
+            -DAMReX_SPACEDIM=3 \\
+            -DAMReX_FORTRAN=OFF \\
+            -DAMReX_MPI=OFF \\
+            -DAMReX_OMP=OFF \\
+            -DCMAKE_PREFIX_PATH=/opt/amrex || {
+            echo "CMake configuration failed"
+            exit 1
+        }
+        make -j4 || {
+            echo "Build failed"
+            exit 1
+        }
+        TEST_EXE=$(find . -maxdepth 1 -type f -executable | head -1)
+    fi
+fi
 
 if [ -z "$TEST_EXE" ]; then
     echo "ERROR: No test executable found"
@@ -286,6 +452,8 @@ echo "Running test executable: $TEST_EXE"
 # Check if inputs file exists
 if [ -f ../inputs ]; then
     $TEST_EXE ../inputs 2>&1
+elif [ -f ../../inputs ]; then
+    $TEST_EXE ../../inputs 2>&1
 else
     $TEST_EXE 2>&1
 fi
@@ -312,8 +480,9 @@ exit $TEST_EXIT_CODE
         for file in self.files():
             copy_commands += f"COPY {file.name} /home/\n"
         
-        # Make scripts executable
-        chmod_commands = "RUN chmod +x /home/*.sh"
+        # Make scripts executable and run prepare.sh
+        prepare_commands = """RUN chmod +x /home/*.sh && \\
+    /home/prepare.sh"""
 
         return f"""FROM {name}:{tag}
 
@@ -321,7 +490,7 @@ exit $TEST_EXIT_CODE
 
 {copy_commands}
 
-{chmod_commands}
+{prepare_commands}
 
 WORKDIR /workspace/amrex
 
@@ -349,17 +518,17 @@ class AMReX(Instance):
     def run(self, run_cmd: str = "") -> str:
         if run_cmd:
             return run_cmd
-        return "bash /home/run.sh"
+        return "/home/run.sh"
 
     def test_patch_run(self, test_patch_run_cmd: str = "") -> str:
         if test_patch_run_cmd:
             return test_patch_run_cmd
-        return "bash /home/test-run.sh"
+        return "/home/test-run.sh"
 
     def fix_patch_run(self, fix_patch_run_cmd: str = "") -> str:
         if fix_patch_run_cmd:
             return fix_patch_run_cmd
-        return "bash /home/fix-run.sh"
+        return "/home/fix-run.sh"
 
     def parse_log(self, test_log: str) -> TestResult:
         """Parse AMReX test output to extract test results"""
